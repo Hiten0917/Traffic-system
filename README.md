@@ -1,4 +1,4 @@
-# Traffic-system
+# Traffic-system_v2
 Assignment 1: Implementing Queue for solving the traffic light problem
 
 DSA Queue Simulator – Windows/VS Code Quick Start
