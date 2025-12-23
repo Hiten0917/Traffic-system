@@ -1,13 +1,12 @@
-DSA-QUEUE-SIMULATOR
+#Traffic-system_v2
+Assignment 1: Implementing Queue for solving the traffic light problem
 
---For Windows VS Code--
+DSA Queue Simulator – Windows/VS Code Quick Start
+Prereqs
+G++ or GCC installed and in PATH
+SDL3 + SDL3_ttf installed; makefile links them
+Build & Run
+VS Code terminal → make
+Terminal 1 → .\build\Simulator.exe
+Terminal 2 → .\build\TrafficGenerator.exe
 
--Requirements
-C/C++ Compiler (G++/GCC): Must be installed and accessible.
-SDL3 Libraries: The SDL3 and SDL3_ttf development libraries must be installed and correctly linked via your makefile
-
--How To Run On VS Code (Terminal)
-Requires Two Separate Terminal
-Open the VS Code Terminal and run the 'make' command to compile
-Open Terminal 1 and start the main simulation window/server. [.\build\Simulator.exe]
-Open Terminal 2 and start the client program. [.\build\TrafficGenerator.exe]
