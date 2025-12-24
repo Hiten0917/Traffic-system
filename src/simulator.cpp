@@ -1,156 +1,312 @@
 #define SDL_MAIN_HANDLED
+#define _USE_MATH_DEFINES
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
-#include <SDL3/SDL_ttf.h>
-#include <iostream>
 #include <vector>
-#include <string>
+#include <algorithm>
+#include <random>
+#include <cmath>
+#include <iostream>
 
-#define WINDOW_WIDTH 800
-#define WINDOW_HEIGHT 800
-#define ROAD_WIDTH 200
-#define MAIN_FONT "C:/Windows/Fonts/arial.ttf" // Ensure this path is correct
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
-// --- Structs ---
-struct TrafficLight {
-    float x, y;
-    bool isGreen;
-    bool horizontal;
+/* * --- CONFIGURATION & GEOMETRY ---
+ * Junction Layout: 4 Roads (A, B, C, D) 
+ * Each Road: L1 (Left Turn), L2 (Straight), L3 (Free-Right)
+ */
+const int SZ = 900;
+const int LW = 70;         // Lane Width
+const int RW = 210;        // Road Width (3 * LW)
+const int CTR = 450;       // Center point
+const int ENT = 345;       // Entry line
+const int EXT = 555;       // Exit line
+const float MAX_SPD = 2.6f;
+const float ACCEL = 0.04f;
+const float BRAKE = 0.15f;
+const float SAFE_DIST = 90.0f;
+
+enum Direction { NORTH = 0, EAST = 1, SOUTH = 2, WEST = 3 };
+enum LightState { RED, YELLOW, GREEN }; // State 1: Stop, State 2: Go
+
+struct Point { float x, y; };
+
+struct Vehicle {
+    Point pos;
+    float angle;
+    float speed;
+    int laneIdx;     // 0-11
+    Direction origin;
+    SDL_Color color;
+    bool active;
+    bool turning;
+    float turnT;     // Interpolation factor 0.0 to 1.0
+    float length = 56.0f, width = 32.0f;
+
+    // Sub-lane helper: 0=Left, 1=Straight, 2=Right
+    int sub() const { return laneIdx % 3; }
 };
 
-// --- Global State ---
-TrafficLight lights[4];
-int lightPhase = 0; // 0: N/S Green, 1: E/W Green
-Uint64 lastSwitch = 0;
+// --- GLOBAL STATE ---
+std::vector<Vehicle> traffic;
+LightState lights[4] = { RED, RED, RED, RED };
+int laneWeights[12] = { 0 };
+int activePhase = NORTH;
+Uint64 lastLightSwitch = 0;
+float currentPhaseDuration = 5000.0f;
+bool isYellowPending = false;
 
-// --- Function Declarations ---
-void drawJunction(SDL_Renderer* renderer, TTF_Font* font);
-void drawSignal(SDL_Renderer* renderer, TrafficLight& light);
-void displayText(SDL_Renderer* renderer, TTF_Font* font, const char* text, float x, float y);
+// --- MATH & UTILITY ---
+Point lerp(Point p1, Point p2, float t) {
+    return { p1.x + (p2.x - p1.x) * t, p1.y + (p2.y - p1.y) * t };
+}
 
-int main(int argc, char* argv[]) {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) return -1;
-    TTF_Init();
+Point getPathPoint(Point p0, Point p1, Point p2, float t) {
+    Point a = lerp(p0, p1, t);
+    Point b = lerp(p1, p2, t);
+    return lerp(a, b, t);
+}
 
-    SDL_Window* window = SDL_CreateWindow("Modernized Junction", WINDOW_WIDTH, WINDOW_HEIGHT, 0);
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, NULL);
-    TTF_Font* font = TTF_OpenFont(MAIN_FONT, 28);
+// --- CORE LOGIC ---
+bool isPathObstructed(Vehicle& v) {
+    // 1. Traffic Light Logic
+    // Special Rule: L3 (Right) is a Free Lane and ignores lights
+    if (v.sub() != 2) {
+        if (lights[v.origin] == RED || (lights[v.origin] == YELLOW && !v.turning)) {
+            if (v.origin == NORTH && v.pos.y > ENT - 50 && v.pos.y < ENT) return true;
+            if (v.origin == SOUTH && v.pos.y < EXT + 50 && v.pos.y > EXT) return true;
+            if (v.origin == EAST  && v.pos.x < EXT + 50 && v.pos.x > EXT) return true;
+            if (v.origin == WEST  && v.pos.x > ENT - 50 && v.pos.x < ENT) return true;
+        }
+    }
 
-    // Initialize Lights (N, S, E, W)
-    lights[0] = { 260, 240, true, false };  // North
-    lights[1] = { 515, 510, true, false };  // South
-    lights[2] = { 510, 260, false, true };  // East
-    lights[3] = { 240, 515, false, true };  // West
+    // 2. Proximity Sensor for Vehicles in front
+    for (auto& other : traffic) {
+        if (&v == &other || !other.active) continue;
+        float dx = v.pos.x - other.pos.x;
+        float dy = v.pos.y - other.pos.y;
+        float dist = std::sqrt(dx * dx + dy * dy);
+
+        if (dist < SAFE_DIST) {
+            // Check if 'other' is ahead of 'v' based on direction
+            if (v.origin == NORTH && other.pos.y > v.pos.y && std::abs(dx) < 25) return true;
+            if (v.origin == SOUTH && other.pos.y < v.pos.y && std::abs(dx) < 25) return true;
+            if (v.origin == EAST  && other.pos.x < v.pos.x && std::abs(dy) < 25) return true;
+            if (v.origin == WEST  && other.pos.x > v.pos.x && std::abs(dy) < 25) return true;
+        }
+    }
+    return false;
+}
+
+void spawnVehicle() {
+    static std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<> laneDist(0, 11);
+    int lane = laneDist(gen);
+    Direction ori = (Direction)(lane / 3);
+    int sub = lane % 3;
+    float laneOffset = (sub * LW) + (LW / 2.0f);
+
+    Vehicle v;
+    v.laneIdx = lane;
+    v.origin = ori;
+    v.speed = 0.0f;
+    v.active = true;
+    v.turning = false;
+    v.turnT = 0.0f;
+    v.color = { (Uint8)(100 + rand() % 155), (Uint8)(100 + rand() % 155), (Uint8)(100 + rand() % 155), 255 };
+
+    if (ori == NORTH) { v.pos = { (float)ENT + laneOffset, -60 }; v.angle = 90.0f; }
+    else if (ori == SOUTH) { v.pos = { (float)EXT - laneOffset, SZ + 60 }; v.angle = 270.0f; }
+    else if (ori == EAST)  { v.pos = { SZ + 60, (float)ENT + laneOffset }; v.angle = 180.0f; }
+    else if (ori == WEST)  { v.pos = { -60, (float)EXT - laneOffset }; v.angle = 0.0f; }
+
+    // Check for collision at spawn point
+    for (auto& existing : traffic) {
+        if (std::abs(existing.pos.x - v.pos.x) < 70 && std::abs(existing.pos.y - v.pos.y) < 70) return;
+    }
+    traffic.push_back(v);
+}
+
+void manageTrafficLights() {
+    Uint64 now = SDL_GetTicks();
+
+    // Priority Lane Check: Road A Lane 2 (AL2)
+    // If AL2 has > 5 cars, it is served immediately after current condition ends
+    bool al2Priority = (laneWeights[1] > 5 && activePhase != NORTH);
+
+    if (now - lastLightSwitch > currentPhaseDuration || al2Priority) {
+        if (!isYellowPending) {
+            lights[activePhase] = YELLOW;
+            currentPhaseDuration = 2000.0f; // 2s Yellow
+            lastLightSwitch = now;
+            isYellowPending = true;
+        } else {
+            lights[activePhase] = RED;
+            activePhase = al2Priority ? NORTH : (activePhase + 1) % 4;
+            lights[activePhase] = GREEN;
+            
+            // Dynamic Green Time based on vehicle count
+            int count = 0;
+            for (int i = activePhase * 3; i < (activePhase * 3) + 3; i++) count += laneWeights[i];
+            currentPhaseDuration = std::max(4000.0f, count * 700.0f);
+
+            lastLightSwitch = now;
+            isYellowPending = false;
+        }
+    }
+}
+
+// --- RENDER HELPERS ---
+void drawRoundedRect(SDL_Renderer* ren, float x, float y, float w, float h, float angle, SDL_Color col) {
+    SDL_FRect r = { x - w / 2, y - h / 2, w, h };
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, 255);
+    // Note: Standard SDL3 FillRect doesn't rotate. For 500 lines we simulate rotation detail.
+    SDL_RenderFillRect(ren, &r);
+    
+    // Detailed "Car" Features
+    SDL_SetRenderDrawColor(ren, 255, 255, 255, 200); // Windows
+    SDL_FRect win;
+    if (angle == 0 || angle == 180) win = { x - w / 4, y - h / 3, w / 2, h / 1.5f };
+    else win = { x - w / 3, y - h / 4, w / 1.5f, h / 2 };
+    SDL_RenderFillRect(ren, &win);
+}
+
+int main(int argc, char** argv) {
+    SDL_Init(SDL_INIT_VIDEO);
+    SDL_Window* win = SDL_CreateWindow("Advanced Queue Traffic Simulator", SZ, SZ, 0);
+    SDL_Renderer* ren = SDL_CreateRenderer(win, NULL);
 
     bool running = true;
-    SDL_Event event;
-    lastSwitch = SDL_GetTicks();
+    lastLightSwitch = SDL_GetTicks();
+    lights[activePhase] = GREEN;
 
     while (running) {
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT) running = false;
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) if (e.type == SDL_EVENT_QUIT) running = false;
+
+        // Spawning logic
+        if (rand() % 60 == 0) spawnVehicle();
+
+        // Update weights for the light logic
+        std::fill_n(laneWeights, 12, 0);
+        for (auto& v : traffic) if (v.speed < 0.2f) laneWeights[v.laneIdx]++;
+
+        manageTrafficLights();
+
+        // Update Vehicle Physics & Pathing
+        for (auto& v : traffic) {
+            if (!v.active) continue;
+
+            bool blocked = isPathObstructed(v);
+            if (blocked) v.speed = std::max(0.0f, v.speed - BRAKE);
+            else v.speed = std::min(MAX_SPD, v.speed + ACCEL);
+
+            // Handle Turning vs Straight
+            if (v.sub() == 1) { // Straight Lane (AL2, BL2, etc.)
+                float rad = v.angle * (M_PI / 180.0f);
+                v.pos.x += std::cos(rad) * v.speed;
+                v.pos.y += std::sin(rad) * v.speed;
+            } else {
+                // Determine if entrance to intersection is reached
+                float distToBox = 0;
+                if (v.origin == NORTH) distToBox = v.pos.y;
+                else if (v.origin == SOUTH) distToBox = SZ - v.pos.y;
+                else if (v.origin == EAST) distToBox = SZ - v.pos.x;
+                else distToBox = v.pos.x;
+
+                if (distToBox > ENT - 10 && !v.turning) v.turning = true;
+
+                if (v.turning) {
+                    v.turnT += 0.006f * v.speed;
+                    Point pStart = v.pos, pEnd;
+                    if (v.sub() == 0) { // Left Turn Path
+                        if (v.origin == NORTH) pEnd = { (float)SZ + 100, (float)EXT - 35 };
+                        else if (v.origin == SOUTH) pEnd = { -100, (float)ENT + 35 };
+                        else if (v.origin == EAST)  pEnd = { (float)ENT + 35, (float)SZ + 100 };
+                        else pEnd = { (float)EXT - 35, -100 };
+                    } else { // Right Turn Path (Free Lane)
+                        if (v.origin == NORTH) pEnd = { -100, (float)ENT + 35 };
+                        else if (v.origin == SOUTH) pEnd = { (float)SZ + 100, (float)EXT - 35 };
+                        else if (v.origin == EAST)  pEnd = { (float)EXT - 35, -100 };
+                        else pEnd = { (float)ENT + 35, (float)SZ + 100 };
+                    }
+                    Point old = v.pos;
+                    v.pos = getPathPoint(v.pos, { (float)CTR, (float)CTR }, pEnd, v.turnT);
+                    v.angle = std::atan2(v.pos.y - old.y, v.pos.x - old.x) * (180.0f / M_PI);
+                    if (v.turnT >= 1.0f) v.active = false;
+                } else {
+                    float rad = v.angle * (M_PI / 180.0f);
+                    v.pos.x += std::cos(rad) * v.speed;
+                    v.pos.y += std::sin(rad) * v.speed;
+                }
+            }
+            // Screen boundary cleanup
+            if (v.pos.x < -150 || v.pos.x > SZ + 150 || v.pos.y < -150 || v.pos.y > SZ + 150) v.active = false;
         }
 
-        // Logic: Switch lights every 5 seconds
-        if (SDL_GetTicks() - lastSwitch > 5000) {
-            lightPhase = !lightPhase;
-            lights[0].isGreen = lights[1].isGreen = (lightPhase == 0);
-            lights[2].isGreen = lights[3].isGreen = (lightPhase == 1);
-            lastSwitch = SDL_GetTicks();
+        // --- DRAWING ---
+        SDL_SetRenderDrawColor(ren, 25, 60, 25, 255); // Grass
+        SDL_RenderClear(ren);
+
+        // Asphalt
+        SDL_SetRenderDrawColor(ren, 45, 45, 45, 255);
+        SDL_FRect roadV = { (float)ENT, 0, (float)RW, (float)SZ };
+        SDL_FRect roadH = { 0, (float)ENT, (float)SZ, (float)RW };
+        SDL_RenderFillRect(ren, &roadV);
+        SDL_RenderFillRect(ren, &roadH);
+
+        // Lane Markings & AL2 Priority Indicator
+        SDL_SetRenderDrawColor(ren, 0, 150, 255, 60); // Blue tint for Priority Lane
+        SDL_FRect prioLane = { (float)ENT + LW, 0, (float)LW, (float)ENT };
+        SDL_RenderFillRect(ren, &prioLane);
+
+        SDL_SetRenderDrawColor(ren, 200, 200, 200, 255);
+        for (int i = 1; i < 3; i++) {
+            for (int j = 0; j < SZ; j += 40) {
+                SDL_RenderLine(ren, ENT + (i * LW), j, ENT + (i * LW), j + 20);
+                SDL_RenderLine(ren, j, ENT + (i * LW), j + 20, ENT + (i * LW));
+            }
         }
 
-        // Background
-        SDL_SetRenderDrawColor(renderer, 40, 100, 40, 255); // Grass
-        SDL_RenderClear(renderer);
+        // Render Vehicles
+        for (auto& v : traffic) {
+            if (!v.active) continue;
+            drawRoundedRect(ren, v.pos.x, v.pos.y, (v.angle == 0 || v.angle == 180) ? v.length : v.width, 
+                                                  (v.angle == 0 || v.angle == 180) ? v.width : v.length, v.angle, v.color);
+        }
 
-        drawJunction(renderer, font);
+        // Traffic Light Visuals
+        for (int i = 0; i < 4; i++) {
+            float lx, ly;
+            if (i == NORTH) { lx = ENT - 40; ly = ENT - 40; }
+            else if (i == SOUTH) { lx = EXT + 15; ly = EXT + 15; }
+            else if (i == EAST)  { lx = EXT + 15; ly = ENT - 40; }
+            else { lx = ENT - 40; ly = EXT + 15; }
 
-        SDL_RenderPresent(renderer);
+            // Housing
+            SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
+            SDL_FRect housing = { lx, ly, 25, 25 };
+            SDL_RenderFillRect(ren, &housing);
+
+            // Lamp
+            if (lights[i] == RED) SDL_SetRenderDrawColor(ren, 255, 0, 0, 255);
+            else if (lights[i] == YELLOW) SDL_SetRenderDrawColor(ren, 255, 255, 0, 255);
+            else SDL_SetRenderDrawColor(ren, 0, 255, 0, 255);
+            
+            SDL_FRect lamp = { lx + 5, ly + 5, 15, 15 };
+            SDL_RenderFillRect(ren, &lamp);
+        }
+
+        SDL_RenderPresent(ren);
         SDL_Delay(16);
+
+        // Remove inactive vehicles
+        traffic.erase(std::remove_if(traffic.begin(), traffic.end(), [](const Vehicle& v) { return !v.active; }), traffic.end());
     }
 
-    TTF_CloseFont(font);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    TTF_Quit();
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
     SDL_Quit();
     return 0;
-}
-
-void drawJunction(SDL_Renderer* renderer, TTF_Font* font) {
-    float mid = WINDOW_WIDTH / 2.0f;
-    float rh = ROAD_WIDTH / 2.0f;
-
-    // 1. Draw Asphalt
-    SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
-    SDL_FRect vRoad = { mid - rh, 0, ROAD_WIDTH, WINDOW_HEIGHT };
-    SDL_FRect hRoad = { 0, mid - rh, WINDOW_WIDTH, ROAD_WIDTH };
-    SDL_RenderFillRect(renderer, &vRoad);
-    SDL_RenderFillRect(renderer, &hRoad);
-
-    // 2. Draw Yellow Center Lines
-    SDL_SetRenderDrawColor(renderer, 255, 200, 0, 255);
-    SDL_FRect vLine = { mid - 2, 0, 4, WINDOW_HEIGHT };
-    SDL_FRect hLine = { 0, mid - 2, WINDOW_WIDTH, 4 };
-    // Clip center lines so they don't overlap the middle box
-    SDL_RenderFillRect(renderer, &vLine);
-    SDL_RenderFillRect(renderer, &hLine);
-
-    // 3. Draw Stop Lines (White Bars)
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    SDL_FRect stopN = { mid - rh, mid - rh - 10, ROAD_WIDTH / 2, 10 };
-    SDL_FRect stopS = { mid, mid + rh, ROAD_WIDTH / 2, 10 };
-    SDL_FRect stopW = { mid - rh - 10, mid, 10, ROAD_WIDTH / 2 };
-    SDL_FRect stopE = { mid + rh, mid - rh, 10, ROAD_WIDTH / 2 };
-    SDL_RenderFillRect(renderer, &stopN);
-    SDL_RenderFillRect(renderer, &stopS);
-    SDL_RenderFillRect(renderer, &stopW);
-    SDL_RenderFillRect(renderer, &stopE);
-
-    // 4. Draw Central Intersection Box (Island look)
-    SDL_SetRenderDrawColor(renderer, 60, 60, 60, 255);
-    SDL_FRect island = { mid - rh, mid - rh, ROAD_WIDTH, ROAD_WIDTH };
-    SDL_RenderFillRect(renderer, &island);
-
-    // 5. Labels and Signals
-    displayText(renderer, font, "NORTH", mid - 40, 20);
-    displayText(renderer, font, "SOUTH", mid - 40, WINDOW_HEIGHT - 50);
-
-    for (int i = 0; i < 4; i++) {
-        drawSignal(renderer, lights[i]);
-    }
-}
-
-void drawSignal(SDL_Renderer* renderer, TrafficLight& light) {
-    // Housing
-    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
-    SDL_FRect body = { light.x, light.y, light.horizontal ? 50.0f : 25.0f, light.horizontal ? 25.0f : 50.0f };
-    SDL_RenderFillRect(renderer, &body);
-
-    // Red Lamp
-    if (!light.isGreen) SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
-    else SDL_SetRenderDrawColor(renderer, 80, 0, 0, 255);
-    SDL_FRect red = { light.x + 5, light.y + 5, 15, 15 };
-    SDL_RenderFillRect(renderer, &red);
-
-    // Green Lamp
-    if (light.isGreen) SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
-    else SDL_SetRenderDrawColor(renderer, 0, 80, 0, 255);
-    SDL_FRect green = { 
-        light.horizontal ? light.x + 30 : light.x + 5, 
-        light.horizontal ? light.y + 5 : light.y + 30, 
-        15, 15 
-    };
-    SDL_RenderFillRect(renderer, &green);
-}
-
-void displayText(SDL_Renderer* renderer, TTF_Font* font, const char* text, float x, float y) {
-    if (!font) return;
-    SDL_Color color = { 255, 255, 255, 255 };
-    SDL_Surface* surf = TTF_RenderText_Blended(font, text, 0, color);
-    SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
-    SDL_FRect dst = { x, y, (float)surf->w, (float)surf->h };
-    SDL_RenderTexture(renderer, tex, NULL, &dst);
-    SDL_DestroySurface(surf);
-    SDL_DestroyTexture(tex);
 }
