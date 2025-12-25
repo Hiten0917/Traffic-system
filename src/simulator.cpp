@@ -28,7 +28,7 @@ const float BRAKE = 0.15f;
 const float SAFE_DIST = 90.0f;
 
 enum Direction { NORTH = 0, EAST = 1, SOUTH = 2, WEST = 3 };
-enum LightState { RED, YELLOW, GREEN }; // State 1: Stop, State 2: Go
+enum LightState { RED, YELLOW, GREEN }; 
 
 struct Point { float x, y; };
 
@@ -71,7 +71,6 @@ Point getPathPoint(Point p0, Point p1, Point p2, float t) {
 // --- CORE LOGIC ---
 bool isPathObstructed(Vehicle& v) {
     // 1. Traffic Light Logic
-    // Special Rule: L3 (Right) is a Free Lane and ignores lights
     if (v.sub() != 2) {
         if (lights[v.origin] == RED || (lights[v.origin] == YELLOW && !v.turning)) {
             if (v.origin == NORTH && v.pos.y > ENT - 50 && v.pos.y < ENT) return true;
@@ -89,7 +88,6 @@ bool isPathObstructed(Vehicle& v) {
         float dist = std::sqrt(dx * dx + dy * dy);
 
         if (dist < SAFE_DIST) {
-            // Check if 'other' is ahead of 'v' based on direction
             if (v.origin == NORTH && other.pos.y > v.pos.y && std::abs(dx) < 25) return true;
             if (v.origin == SOUTH && other.pos.y < v.pos.y && std::abs(dx) < 25) return true;
             if (v.origin == EAST  && other.pos.x < v.pos.x && std::abs(dy) < 25) return true;
@@ -102,9 +100,29 @@ bool isPathObstructed(Vehicle& v) {
 void spawnVehicle() {
     static std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<> laneDist(0, 11);
-    int lane = laneDist(gen);
-    Direction ori = (Direction)(lane / 3);
-    int sub = lane % 3;
+    
+    int lane, sub;
+    Direction ori;
+    bool valid = false;
+
+    // Retry loop to enforce asymmetric layout
+    while(!valid) {
+        lane = laneDist(gen);
+        ori = (Direction)(lane / 3);
+        sub = lane % 3;
+        valid = true;
+
+        // --- MODIFICATION: Road A (North) Configuration ---
+        // Only allow spawning in Lane 1 (AL2/Center). 
+        // Lanes 0 and 2 are blocked for incoming traffic (used as Outgoing).
+        if (ori == NORTH && sub != 1) valid = false;
+
+        // --- MODIFICATION: Road C (South) Balance ---
+        // Since North Lane 1 is incoming, South Lane 1 (Straight) would cause a head-on collision.
+        // We restrict South to lanes 0 and 2 so they flow into the empty North outgoing lanes.
+        if (ori == SOUTH && sub == 1) valid = false; 
+    }
+
     float laneOffset = (sub * LW) + (LW / 2.0f);
 
     Vehicle v;
@@ -121,7 +139,7 @@ void spawnVehicle() {
     else if (ori == EAST)  { v.pos = { SZ + 60, (float)ENT + laneOffset }; v.angle = 180.0f; }
     else if (ori == WEST)  { v.pos = { -60, (float)EXT - laneOffset }; v.angle = 0.0f; }
 
-    // Check for collision at spawn point
+    // Collision check at spawn
     for (auto& existing : traffic) {
         if (std::abs(existing.pos.x - v.pos.x) < 70 && std::abs(existing.pos.y - v.pos.y) < 70) return;
     }
@@ -130,15 +148,14 @@ void spawnVehicle() {
 
 void manageTrafficLights() {
     Uint64 now = SDL_GetTicks();
-
-    // Priority Lane Check: Road A Lane 2 (AL2)
-    // If AL2 has > 5 cars, it is served immediately after current condition ends
-    bool al2Priority = (laneWeights[1] > 5 && activePhase != NORTH);
+    // Use Lane 1 index for North since sub 0 and 2 are empty now
+    int northWeight = laneWeights[1]; 
+    bool al2Priority = (northWeight > 5 && activePhase != NORTH);
 
     if (now - lastLightSwitch > currentPhaseDuration || al2Priority) {
         if (!isYellowPending) {
             lights[activePhase] = YELLOW;
-            currentPhaseDuration = 2000.0f; // 2s Yellow
+            currentPhaseDuration = 2000.0f; 
             lastLightSwitch = now;
             isYellowPending = true;
         } else {
@@ -146,7 +163,6 @@ void manageTrafficLights() {
             activePhase = al2Priority ? NORTH : (activePhase + 1) % 4;
             lights[activePhase] = GREEN;
             
-            // Dynamic Green Time based on vehicle count
             int count = 0;
             for (int i = activePhase * 3; i < (activePhase * 3) + 3; i++) count += laneWeights[i];
             currentPhaseDuration = std::max(4000.0f, count * 700.0f);
@@ -157,15 +173,12 @@ void manageTrafficLights() {
     }
 }
 
-// --- RENDER HELPERS ---
 void drawRoundedRect(SDL_Renderer* ren, float x, float y, float w, float h, float angle, SDL_Color col) {
     SDL_FRect r = { x - w / 2, y - h / 2, w, h };
     SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, 255);
-    // Note: Standard SDL3 FillRect doesn't rotate. For 500 lines we simulate rotation detail.
     SDL_RenderFillRect(ren, &r);
     
-    // Detailed "Car" Features
-    SDL_SetRenderDrawColor(ren, 255, 255, 255, 200); // Windows
+    SDL_SetRenderDrawColor(ren, 255, 255, 255, 200); 
     SDL_FRect win;
     if (angle == 0 || angle == 180) win = { x - w / 4, y - h / 3, w / 2, h / 1.5f };
     else win = { x - w / 3, y - h / 4, w / 1.5f, h / 2 };
@@ -185,16 +198,14 @@ int main(int argc, char** argv) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) if (e.type == SDL_EVENT_QUIT) running = false;
 
-        // Spawning logic
         if (rand() % 60 == 0) spawnVehicle();
 
-        // Update weights for the light logic
         std::fill_n(laneWeights, 12, 0);
         for (auto& v : traffic) if (v.speed < 0.2f) laneWeights[v.laneIdx]++;
 
         manageTrafficLights();
 
-        // Update Vehicle Physics & Pathing
+        // Update Physics
         for (auto& v : traffic) {
             if (!v.active) continue;
 
@@ -202,13 +213,13 @@ int main(int argc, char** argv) {
             if (blocked) v.speed = std::max(0.0f, v.speed - BRAKE);
             else v.speed = std::min(MAX_SPD, v.speed + ACCEL);
 
-            // Handle Turning vs Straight
-            if (v.sub() == 1) { // Straight Lane (AL2, BL2, etc.)
+            if (v.sub() == 1) { 
+                // Straight Lane
                 float rad = v.angle * (M_PI / 180.0f);
                 v.pos.x += std::cos(rad) * v.speed;
                 v.pos.y += std::sin(rad) * v.speed;
             } else {
-                // Determine if entrance to intersection is reached
+                // Turning Logic
                 float distToBox = 0;
                 if (v.origin == NORTH) distToBox = v.pos.y;
                 else if (v.origin == SOUTH) distToBox = SZ - v.pos.y;
@@ -220,17 +231,28 @@ int main(int argc, char** argv) {
                 if (v.turning) {
                     v.turnT += 0.006f * v.speed;
                     Point pStart = v.pos, pEnd;
-                    if (v.sub() == 0) { // Left Turn Path
+                    
+                    if (v.sub() == 0) { // Left Turn
                         if (v.origin == NORTH) pEnd = { (float)SZ + 100, (float)EXT - 35 };
                         else if (v.origin == SOUTH) pEnd = { -100, (float)ENT + 35 };
-                        else if (v.origin == EAST)  pEnd = { (float)ENT + 35, (float)SZ + 100 };
-                        else pEnd = { (float)EXT - 35, -100 };
-                    } else { // Right Turn Path (Free Lane)
+                        
+                        // --- MODIFICATION: West turning Left to North ---
+                        // Target North Lane 0 (AL1) which is now Outgoing
+                        else if (v.origin == WEST) pEnd = { (float)ENT + 35, -100 }; 
+                        
+                        else pEnd = { (float)ENT + 35, (float)SZ + 100 };
+                    } else { // Right Turn
                         if (v.origin == NORTH) pEnd = { -100, (float)ENT + 35 };
                         else if (v.origin == SOUTH) pEnd = { (float)SZ + 100, (float)EXT - 35 };
-                        else if (v.origin == EAST)  pEnd = { (float)EXT - 35, -100 };
+                        
+                        // --- MODIFICATION: East turning Right to North ---
+                        // Target North Lane 2 (AL3) which is now Outgoing
+                        // ENT + 175 corresponds to the far right lane of North road
+                        else if (v.origin == EAST)  pEnd = { (float)ENT + 175, -100 };
+                        
                         else pEnd = { (float)ENT + 35, (float)SZ + 100 };
                     }
+
                     Point old = v.pos;
                     v.pos = getPathPoint(v.pos, { (float)CTR, (float)CTR }, pEnd, v.turnT);
                     v.angle = std::atan2(v.pos.y - old.y, v.pos.x - old.x) * (180.0f / M_PI);
@@ -241,42 +263,39 @@ int main(int argc, char** argv) {
                     v.pos.y += std::sin(rad) * v.speed;
                 }
             }
-            // Screen boundary cleanup
             if (v.pos.x < -150 || v.pos.x > SZ + 150 || v.pos.y < -150 || v.pos.y > SZ + 150) v.active = false;
         }
 
         // --- DRAWING ---
-        SDL_SetRenderDrawColor(ren, 25, 60, 25, 255); // Grass
+        SDL_SetRenderDrawColor(ren, 25, 60, 25, 255);
         SDL_RenderClear(ren);
 
-        // Asphalt
         SDL_SetRenderDrawColor(ren, 45, 45, 45, 255);
         SDL_FRect roadV = { (float)ENT, 0, (float)RW, (float)SZ };
         SDL_FRect roadH = { 0, (float)ENT, (float)SZ, (float)RW };
         SDL_RenderFillRect(ren, &roadV);
         SDL_RenderFillRect(ren, &roadH);
 
-        // Lane Markings & AL2 Priority Indicator
-        SDL_SetRenderDrawColor(ren, 0, 150, 255, 60); // Blue tint for Priority Lane
-        SDL_FRect prioLane = { (float)ENT + LW, 0, (float)LW, (float)ENT };
-        SDL_RenderFillRect(ren, &prioLane);
-
+        // Lane Markings - Visualizing the North Road Difference
         SDL_SetRenderDrawColor(ren, 200, 200, 200, 255);
         for (int i = 1; i < 3; i++) {
             for (int j = 0; j < SZ; j += 40) {
+                // North Road (0 to ENT) has distinct markings logic? 
+                // For simplicity, we keep standard dashed lines everywhere.
                 SDL_RenderLine(ren, ENT + (i * LW), j, ENT + (i * LW), j + 20);
                 SDL_RenderLine(ren, j, ENT + (i * LW), j + 20, ENT + (i * LW));
             }
         }
+        
+        // --- REMOVED BLUE LANE HIGHLIGHT HERE ---
 
-        // Render Vehicles
         for (auto& v : traffic) {
             if (!v.active) continue;
             drawRoundedRect(ren, v.pos.x, v.pos.y, (v.angle == 0 || v.angle == 180) ? v.length : v.width, 
                                                   (v.angle == 0 || v.angle == 180) ? v.width : v.length, v.angle, v.color);
         }
 
-        // Traffic Light Visuals
+        // Lights
         for (int i = 0; i < 4; i++) {
             float lx, ly;
             if (i == NORTH) { lx = ENT - 40; ly = ENT - 40; }
@@ -284,12 +303,10 @@ int main(int argc, char** argv) {
             else if (i == EAST)  { lx = EXT + 15; ly = ENT - 40; }
             else { lx = ENT - 40; ly = EXT + 15; }
 
-            // Housing
             SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
             SDL_FRect housing = { lx, ly, 25, 25 };
             SDL_RenderFillRect(ren, &housing);
 
-            // Lamp
             if (lights[i] == RED) SDL_SetRenderDrawColor(ren, 255, 0, 0, 255);
             else if (lights[i] == YELLOW) SDL_SetRenderDrawColor(ren, 255, 255, 0, 255);
             else SDL_SetRenderDrawColor(ren, 0, 255, 0, 255);
@@ -300,8 +317,6 @@ int main(int argc, char** argv) {
 
         SDL_RenderPresent(ren);
         SDL_Delay(16);
-
-        // Remove inactive vehicles
         traffic.erase(std::remove_if(traffic.begin(), traffic.end(), [](const Vehicle& v) { return !v.active; }), traffic.end());
     }
 
